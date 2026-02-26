@@ -12,7 +12,7 @@ import json
 
 HOST = "turntable.proxy.rlwy.net"
 PORT = int(os.environ.get("PORT", 55000))
-SECRET = os.environ.get("RELAY_SECRET", "changeme123")
+SECRET = os.environ.get("RELAY_SECRET", "mysecret99")
 
 damaged_conn = None
 controller_conn = None
