@@ -24,9 +24,9 @@ except ImportError:
     from pynput import keyboard as kb
 
 # ─── CONFIG ─────────────────────────────────────────────
-RELAY_HOST = "YOUR_RAILWAY_APP.up.railway.app"  # ← change this
-RELAY_PORT = 55000                               # ← change if Railway assigns different
-SECRET      = "changeme123"                      # ← must match relay server
+RELAY_HOST = "turntable.proxy.rlwy.net"  # ← change this
+RELAY_PORT = 11654                               # ← change if Railway assigns different
+SECRET      = "mysecret99"                      # ← must match relay server
 # ────────────────────────────────────────────────────────
 
 keyboard = Controller()
