@@ -10,7 +10,7 @@ import os
 import time
 import json
 
-HOST = "0.0.0.0"
+HOST = "turntable.proxy.rlwy.net"
 PORT = int(os.environ.get("PORT", 55000))
 SECRET = os.environ.get("RELAY_SECRET", "changeme123")
 
