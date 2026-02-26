@@ -12,8 +12,7 @@ import json
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 55000))
-SECRET = os.environ.get("RELAY_SECRET", "mysecret99")
-
+SECRET = os.environ.get("RELAY_SECRET", "changeme123")
 damaged_conn = None
 controller_conn = None
 conn_lock = threading.Lock()
