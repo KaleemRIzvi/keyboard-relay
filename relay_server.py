@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 relay_server.py - Central relay server (host on Railway / VPS)
-Routes all traffic between the damaged laptop (agent) and controller (GUI).
+Routes traffic between MULTIPLE agents and a single controller.
+Each agent identifies itself by hostname — reconnects replace the old slot.
 Supports TLS if CERT_FILE and KEY_FILE env vars are set.
 """
 
@@ -14,15 +15,15 @@ import json
 
 HOST   = "0.0.0.0"
 PORT   = int(os.environ.get("PORT", 55000))
-SECRET = os.environ.get("RELAY_SECRET", "mysecret99")  # ← change to mysecret99
+SECRET = os.environ.get("RELAY_SECRET", "mysecret99")
 
-# Optional TLS (set env vars CERT_FILE and KEY_FILE on your server)
 CERT_FILE = os.environ.get("CERT_FILE", "")
 KEY_FILE  = os.environ.get("KEY_FILE",  "")
 
-agent_conn      = None
+# { device_id: conn }
+agents: dict = {}
 controller_conn = None
-conn_lock       = threading.Lock()
+conn_lock = threading.Lock()
 
 
 def log(msg):
@@ -56,10 +57,19 @@ def recv_line(conn, timeout=15):
         conn.settimeout(None)
 
 
+def notify_controller_agent_list():
+    """Push current online device list to controller."""
+    with conn_lock:
+        if controller_conn:
+            device_list = list(agents.keys())
+            send_json(controller_conn, {"type": "agent_list", "devices": device_list})
+
+
 def handle_client(conn, addr):
-    global agent_conn, controller_conn
+    global controller_conn
     log(f"New connection from {addr[0]}:{addr[1]}")
     role = None
+    device_id = None
     try:
         raw = recv_line(conn, timeout=15)
         if raw is None:
@@ -79,24 +89,39 @@ def handle_client(conn, addr):
 
         role = msg.get("role")
         if role not in ("agent", "controller"):
-            send_json(conn, {"status": "error", "msg": "Bad role — use 'agent' or 'controller'"})
+            send_json(conn, {"status": "error", "msg": "Bad role"})
             return
 
-        with conn_lock:
-            if role == "agent":
-                if agent_conn:
-                    try: agent_conn.close()
-                    except: pass
-                agent_conn = conn
-                log(f"Agent (damaged laptop) connected from {addr[0]}")
-            else:
-                if controller_conn:
-                    try: controller_conn.close()
-                    except: pass
-                controller_conn = conn
-                log(f"Controller connected from {addr[0]}")
+        if role == "agent":
+            device_id = msg.get("device_id") or addr[0]
+            with conn_lock:
+                if device_id in agents:
+                    try:
+                        agents[device_id].close()
+                    except Exception:
+                        pass
+                    log(f"Agent '{device_id}' replaced (reconnect)")
+                agents[device_id] = conn
+            log(f"Agent '{device_id}' connected from {addr[0]}")
+            send_json(conn, {"status": "ok", "role": "agent", "device_id": device_id,
+                             "msg": f"Connected as agent '{device_id}'"})
+            notify_controller_agent_list()
 
-        send_json(conn, {"status": "ok", "role": role, "msg": f"Connected as {role}"})
+        else:  # controller
+            with conn_lock:
+                if controller_conn:
+                    try:
+                        controller_conn.close()
+                    except Exception:
+                        pass
+                controller_conn = conn
+            log(f"Controller connected from {addr[0]}")
+            with conn_lock:
+                device_list = list(agents.keys())
+            send_json(conn, {"status": "ok", "role": "controller",
+                             "msg": "Connected as controller",
+                             "devices": device_list})
+
         log(f"Auth OK for {role} @ {addr[0]}")
 
         buffer = ""
@@ -115,27 +140,39 @@ def handle_client(conn, addr):
                         parsed = json.loads(line)
                     except Exception:
                         continue
+
                     with conn_lock:
-                        if role == "agent" and controller_conn:
-                            send_json(controller_conn, parsed)
-                        elif role == "controller" and agent_conn:
-                            send_json(agent_conn, parsed)
+                        if role == "agent":
+                            parsed["device_id"] = device_id
+                            if controller_conn:
+                                send_json(controller_conn, parsed)
+                        elif role == "controller":
+                            target = parsed.get("target_device")
+                            if target and target in agents:
+                                send_json(agents[target], parsed)
+                            else:
+                                log(f"[Relay] Unknown target '{target}' — dropping")
+
             except Exception as e:
-                log(f"Relay error ({role}): {e}")
+                log(f"Relay error ({role}/{device_id}): {e}")
                 break
 
     except Exception as e:
         log(f"Client handler error: {e}")
     finally:
         with conn_lock:
-            if role == "agent" and agent_conn is conn:
-                agent_conn = None
-                log("Agent disconnected")
+            if role == "agent" and device_id and agents.get(device_id) is conn:
+                del agents[device_id]
+                log(f"Agent '{device_id}' disconnected")
             elif role == "controller" and controller_conn is conn:
                 controller_conn = None
                 log("Controller disconnected")
-        try: conn.close()
-        except: pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+        if role == "agent":
+            notify_controller_agent_list()
 
 
 def main():
@@ -150,7 +187,7 @@ def main():
     except Exception as e:
         log(f"BIND FAILED: {e}")
         return
-    raw_server.listen(10)
+    raw_server.listen(20)
 
     if CERT_FILE and KEY_FILE:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
