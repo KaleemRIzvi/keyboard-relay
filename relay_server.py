@@ -13,6 +13,7 @@ CERT_FILE = os.environ.get("CERT_FILE", "")
 KEY_FILE  = os.environ.get("KEY_FILE",  "")
 
 agents: dict = {}          # { device_id: conn }
+agents_last_seen: dict = {}  # { device_id: timestamp }
 controller_conn = None
 conn_lock = threading.Lock()
 
@@ -85,6 +86,7 @@ def handle_client(conn, addr):
                     except: pass
                     log(f"Agent '{device_id}' replaced")
                 agents[device_id] = conn
+                agents_last_seen[device_id] = time.time()
             log(f"Agent '{device_id}' online")
             send_json(conn, {"status": "ok", "role": "agent", "device_id": device_id})
             # Notify controller AFTER releasing conn_lock (no deadlock)
@@ -117,15 +119,19 @@ def handle_client(conn, addr):
                         parsed = json.loads(line)
                     except Exception:
                         continue
+                    # Determine target connection WITHOUT holding the lock during send
+                    target_conn = None
                     with conn_lock:
                         if role == "agent":
                             parsed["device_id"] = device_id
-                            if controller_conn:
-                                send_json(controller_conn, parsed)
+                            agents_last_seen[device_id] = time.time()
+                            target_conn = controller_conn
                         elif role == "controller":
                             target = parsed.get("target_device")
                             if target and target in agents:
-                                send_json(agents[target], parsed)
+                                target_conn = agents[target]
+                    if target_conn:
+                        send_json(target_conn, parsed)
             except Exception as e:
                 log(f"Relay error ({role}): {e}"); break
 
@@ -135,6 +141,7 @@ def handle_client(conn, addr):
         with conn_lock:
             if role == "agent" and device_id and agents.get(device_id) is conn:
                 del agents[device_id]
+                agents_last_seen.pop(device_id, None)
                 log(f"Agent '{device_id}' offline")
             elif role == "controller" and controller_conn is conn:
                 controller_conn = None
@@ -142,6 +149,28 @@ def handle_client(conn, addr):
         try: conn.close()
         except: pass
         if role == "agent":
+            _push_agent_list()
+
+
+def _heartbeat_watchdog():
+    """Remove agents that have gone silent (WiFi drop without clean disconnect)."""
+    TIMEOUT = 60  # seconds
+    while True:
+        time.sleep(30)
+        now = time.time()
+        dead = []
+        with conn_lock:
+            for dev, ts in list(agents_last_seen.items()):
+                if now - ts > TIMEOUT:
+                    dead.append(dev)
+        for dev in dead:
+            log(f"Agent '{dev}' heartbeat timeout — removing")
+            with conn_lock:
+                conn = agents.pop(dev, None)
+                agents_last_seen.pop(dev, None)
+            if conn:
+                try: conn.close()
+                except: pass
             _push_agent_list()
 
 
@@ -156,6 +185,7 @@ def main():
         ctx.load_cert_chain(CERT_FILE, KEY_FILE)
         srv = ctx.wrap_socket(srv, server_side=True)
         log("TLS ready")
+    threading.Thread(target=_heartbeat_watchdog, daemon=True).start()
     log("Ready — waiting for connections")
     while True:
         try:
